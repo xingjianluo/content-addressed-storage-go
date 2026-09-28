@@ -5,10 +5,13 @@
 // Wire format (JSON, one object):
 //
 //	{
-//	  "version": 1,
+//	  "version": 2,
 //	  "name": "example.txt",
-//	  "entries": [ {"id": "<sha256-hex>", "size": 123} ],
-//	  ... unknown fields are preserved verbatim ...
+//	  "entries": [
+//	    {"id": "<sha256-hex>", "size": 123,
+//	     ... chunk-level extension fields, preserved verbatim ...}
+//	  ],
+//	  ... object-level extension fields, preserved verbatim ...
 //	}
 //
 // Compatibility rules:
@@ -17,17 +20,22 @@
 //   - A manifest whose Version is greater than MaxSupportedVersion is
 //     rejected with ErrUnsupportedVersion; such data is never silently
 //     rewritten or partially understood.
-//   - Unknown fields encountered while reading are retained in Unknown and
-//     re-emitted by Marshal, so a read-modify-write cycle never drops
-//     information produced by a newer/other writer.
+//   - Unknown fields encountered while reading are retained verbatim — both
+//     object-level ones in Manifest.Unknown and per-chunk (per-entry) ones
+//     in Entry.Unknown — and re-emitted by Marshal, so a read-modify-write
+//     cycle never drops information produced by a newer/other writer.
+//   - Numbers are decoded with json.Number, so arbitrarily large integers
+//     keep every digit; no float64 approximation is ever introduced.
 //   - Malformed JSON, wrong field types or invalid entries are reported as
 //     ErrInvalidManifest with a wrapped reason.
 package manifest
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/xingjianluo/content-addressed-storage-go/pkg/chunk"
 )
@@ -37,15 +45,30 @@ const (
 	// MinVersion is the oldest data version this build can read.
 	MinVersion = 1
 	// CurrentVersion is the schema version produced by this build.
-	CurrentVersion = 1
+	//
+	// Version history:
+	//   1: {version,name,entries:[{id,size}]} plus preserved top-level
+	//      unknown fields;
+	//   2: like v1, but every entry may additionally carry its own bag of
+	//      upper-layer-defined extension fields (chunk-level extensions),
+	//      which are preserved verbatim just like top-level ones.
+	CurrentVersion = 2
 	// MaxSupportedVersion is the newest data version this build understands.
-	MaxSupportedVersion = 1
+	MaxSupportedVersion = 2
 )
 
-// Entry references one chunk of an object in order.
+// Entry references one chunk of an object in order. Besides the built-in
+// content ID and length, an entry carries chunk-level extension
+// information (Unknown) defined by upper-layer tools: arbitrary nested
+// objects, arrays, booleans, null or (arbitrarily large) integers. It is
+// preserved verbatim across unmarshal/marshal and never dropped by a
+// read-modify-write cycle.
 type Entry struct {
 	ID   chunk.ID `json:"id"`
 	Size int      `json:"size"`
+	// Unknown preserves chunk-level (per-entry) schema fields this build
+	// does not know about.
+	Unknown map[string]any
 }
 
 // Manifest is the versioned content list. Unknown holds fields not part of
@@ -69,6 +92,12 @@ var knownFields = map[string]struct{}{
 	"version": {},
 	"name":    {},
 	"entries": {},
+}
+
+// knownEntryFields are the built-in fields of an entries[] element.
+var knownEntryFields = map[string]struct{}{
+	"id":   {},
+	"size": {},
 }
 
 // Validate checks structural and version rules.
@@ -125,7 +154,16 @@ func Marshal(m *Manifest) ([]byte, error) {
 	}
 	entries := make([]map[string]any, 0, len(m.Entries))
 	for _, e := range m.Entries {
-		entries = append(entries, map[string]any{"id": string(e.ID), "size": e.Size})
+		em := map[string]any{"id": string(e.ID), "size": e.Size}
+		for k, v := range e.Unknown {
+			if _, known := knownEntryFields[k]; known {
+				// A preserved key must never masquerade as a built-in field.
+				return nil, fmt.Errorf("%w: entries: unknown field collides with built-in field %q",
+					ErrInvalidManifest, k)
+			}
+			em[k] = v
+		}
+		entries = append(entries, em)
 	}
 	out["entries"] = entries
 	data, err := json.Marshal(out)
@@ -141,8 +179,15 @@ func Unmarshal(data []byte) (*Manifest, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("%w: empty input", ErrInvalidManifest)
 	}
-	if err := json.Unmarshal(data, &raw); err != nil {
+	// UseNumber keeps every integer as an exact json.Number instead of a
+	// float64, so large integers survive with all digits intact.
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidManifest, err)
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("%w: multiple JSON values", ErrInvalidManifest)
 	}
 
 	m := &Manifest{Unknown: map[string]any{}}
@@ -192,7 +237,15 @@ func Unmarshal(data []byte) (*Manifest, error) {
 					return nil, fmt.Errorf("%w: entries[%d].size: %v", ErrInvalidManifest, i, err)
 				}
 			}
-			m.Entries = append(m.Entries, Entry{ID: chunk.ID(idStr), Size: size})
+			entry := Entry{ID: chunk.ID(idStr), Size: size, Unknown: map[string]any{}}
+			// Preserve every non-built-in field of this entry verbatim.
+			for ek, ev := range obj {
+				if _, known := knownEntryFields[ek]; known {
+					continue
+				}
+				entry.Unknown[ek] = ev
+			}
+			m.Entries = append(m.Entries, entry)
 		}
 	}
 
@@ -230,16 +283,26 @@ func ContentID(m *Manifest) (chunk.ID, error) {
 	return chunk.ComputeID(data), nil
 }
 
-// asInt accepts a JSON number that is an integer value.
+// asInt accepts a JSON number that is an exact integer value. A
+// json.Number (the type produced by UseNumber) is parsed digit by digit so
+// that no precision is lost on its way to an int; a float64 is accepted
+// only when it already holds an integral value.
 func asInt(v any) (int, error) {
-	f, ok := v.(float64)
-	if !ok {
+	switch n := v.(type) {
+	case json.Number:
+		i, err := strconv.ParseInt(n.String(), 10, 64)
+		if err != nil {
+			return 0, errors.New("expected integer")
+		}
+		return int(i), nil
+	case float64:
+		if n != float64(int64(n)) {
+			return 0, errors.New("expected integer")
+		}
+		return int(n), nil
+	default:
 		return 0, errors.New("expected integer")
 	}
-	if f != float64(int64(f)) {
-		return 0, errors.New("expected integer")
-	}
-	return int(f), nil
 }
 
 func asString(v any) (string, error) {

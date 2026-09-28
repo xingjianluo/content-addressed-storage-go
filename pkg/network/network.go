@@ -28,6 +28,10 @@ type Network struct {
 	// sorted holds nodes sorted by ID; placement is derived from it.
 	sorted []*store.Store
 
+	// heads records the latest committed manifest per object name and
+	// serializes read-modify-write updates of the same object.
+	heads *heads
+
 	logger Logger
 }
 
@@ -44,7 +48,7 @@ func (discardLogger) Logf(string, ...any) {}
 func New(nodes ...*store.Store) *Network {
 	sorted := append([]*store.Store(nil), nodes...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID() < sorted[j].ID() })
-	return &Network{nodes: nodes, sorted: sorted, logger: discardLogger{}}
+	return &Network{nodes: nodes, sorted: sorted, heads: newHeads(), logger: discardLogger{}}
 }
 
 // SetLogger installs a decision logger (e.g. a test logger).
@@ -78,6 +82,9 @@ var (
 	ErrQuorumUnavailable = errors.New("network: quorum unavailable")
 	// ErrAllReplicasBad means every reachable replica failed verification.
 	ErrAllReplicasBad = errors.New("network: all replicas failed integrity check")
+	// ErrObjectNotFound means no object head is registered for the name
+	// (the object was never PutObject/registered on this network).
+	ErrObjectNotFound = errors.New("network: object not found")
 )
 
 // placementOrder returns nodes in the deterministic preference order for id.
@@ -264,6 +271,12 @@ func (n *Network) GetChunk(ctx context.Context, id chunk.ID, opt Options) (chunk
 // replication, then writes the manifest itself as a content-addressed
 // chunk. The returned ID identifies the serialized manifest.
 func (n *Network) PutObject(ctx context.Context, name string, data []byte, opt Options) (chunk.ID, *manifest.Manifest, error) {
+	// Serialize against updates of the same object name.
+	if name != "" {
+		mu := n.heads.lockFor(name)
+		mu.Lock()
+		defer mu.Unlock()
+	}
 	size := opt.ChunkSize
 	if size <= 0 {
 		size = chunk.DefaultSplitSize
@@ -289,6 +302,11 @@ func (n *Network) PutObject(ctx context.Context, name string, data []byte, opt O
 	mc := chunk.Chunk{ID: chunk.ComputeID(raw), Data: raw}
 	if _, err := n.PutChunk(ctx, mc, opt); err != nil {
 		return "", nil, err
+	}
+	// Record the initial object head so concurrent UpdateObject writers
+	// serialize against and stack onto this manifest.
+	if name != "" {
+		n.heads.commit(name, mc.ID)
 	}
 	return mc.ID, man, nil
 }

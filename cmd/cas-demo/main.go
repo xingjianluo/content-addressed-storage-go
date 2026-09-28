@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/xingjianluo/content-addressed-storage-go/pkg/chunk"
+	"github.com/xingjianluo/content-addressed-storage-go/pkg/manifest"
 	"github.com/xingjianluo/content-addressed-storage-go/pkg/network"
 	"github.com/xingjianluo/content-addressed-storage-go/pkg/store"
 )
@@ -70,6 +72,32 @@ func main() {
 		log.Fatalf("read-back mismatch: %v", err)
 	}
 	fmt.Println("READ-OK identical bytes reconstructed from verified chunks")
+
+	// 2b) Atomic read-modify-write: attach object-level and chunk-level
+	//     extensions (big integers included), then read back by the new head.
+	newID, _, err := net.UpdateObject(ctx, "demo.bin", opt, func(m *manifest.Manifest) error {
+		if m.Unknown == nil {
+			m.Unknown = map[string]any{}
+		}
+		m.Unknown["x-tool"] = map[string]any{"owner": "cas-demo", "big": json.Number("123456789012345678901234567890")}
+		e := &m.Entries[0]
+		if e.Unknown == nil {
+			e.Unknown = map[string]any{}
+		}
+		e.Unknown["x-checksum-algo"] = "farmhash64"
+		e.Unknown["x-tags"] = []any{"demo", "chunk-0"}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("update object extensions: %v", err)
+	}
+	_, exMan, err := net.GetObject(ctx, newID, opt)
+	if err != nil {
+		log.Fatalf("read back extended object: %v", err)
+	}
+	fmt.Printf("EXT-OK object=%s chunk0-ext=%v bigint=%s\n",
+		"demo.bin", exMan.Entries[0].Unknown["x-tags"],
+		exMan.Unknown["x-tool"].(map[string]any)["big"])
 
 	// 3) Start background repair, then take one replica down and lose data
 	//    on another, to be recovered when they return.

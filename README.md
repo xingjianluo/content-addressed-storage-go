@@ -8,16 +8,19 @@ Storage, CAS）网络，用于验证：
 - 多个本地存储节点之间的副本写入、读取、读修复与后台修复；
 - 并发写入 / 读取与节点短暂不可用同时发生时，已确认写入不丢失、副本计数
   不虚高，节点恢复后各副本收敛一致；
-- 内容清单（manifest）版本演进的向后 / 向前兼容，读改写不静默丢信息。
+- 内容清单（manifest）版本演进的向后 / 向前兼容，读改写不静默丢信息；
+- **对象级与数据块级（per-chunk）扩展属性**：不同上层工具写入的任意 JSON
+  扩展（嵌套对象、数组、布尔、null、超大整数）在读改写、复制与修复中逐位
+  保留，大整数无精度丢失。
 
 ## 目录结构
 
 | 路径 | 职责 |
 | --- | --- |
 | `pkg/chunk` | 确定性定长切分、SHA-256 内容标识、载荷校验 |
-| `pkg/manifest` | 版本化内容清单，JSON 编解码、兼容规则、未知字段保留 |
+| `pkg/manifest` | 版本化内容清单，JSON 编解码、兼容规则、对象级/块级未知字段保留、大整数逐位解析 |
 | `pkg/store` | 单节点磁盘存储：原子写、读时重算哈希、可用性开关 |
-| `pkg/network` | 多节点副本放置、仲裁写、读修复、后台修复循环 |
+| `pkg/network` | 多节点副本放置、仲裁写、读修复、后台修复、对象原子读改写（UpdateObject） |
 | `cmd/cas-demo` | 一键本地端到端演示（写入 → 故障 → 恢复 → 收敛） |
 
 ## 1. 内容标识与完整性规则
@@ -50,6 +53,7 @@ Storage, CAS）网络，用于验证：
 | 存在副本但全部校验失败 | `network.ErrAllReplicasBad` |
 | 清单 JSON / 结构非法 | `manifest.ErrInvalidManifest` |
 | 清单版本新于本程序可理解的上限 | `manifest.ErrUnsupportedVersion` |
+| 对未注册过的对象名调用 `UpdateObject` | `network.ErrObjectNotFound` |
 
 损坏（有文件但哈希错）与缺失（无文件）是两类不同错误，二者都不会被当成
 有效数据。
@@ -100,32 +104,101 @@ Storage, CAS）网络，用于验证：
 - 已确认写入不覆盖、不删除已有副本；节点短暂不可用期间数据留在磁盘，恢复
   后由读修复 / 后台修复补齐，最终所有副本集合节点收敛一致。
 
-## 3. 版本兼容策略（清单）
+## 3. 扩展属性规则（对象级 / 数据块级）
+
+不同的上层工具可以往清单里塞各自的附加信息。扩展分两级，规则完全一致：
+
+- **对象级**：清单 JSON 顶层除 `version` / `name` / `entries` 之外的任意字段，
+  读入后保存在 `Manifest.Unknown`。
+- **数据块级**：`entries[]` 每个元素除内建的 `id` / `size` 之外的任意字段，
+  读入后保存在 `manifest.Entry.Unknown`。即每个数据块都能独立携带一份扩展。
+
+```json
+{
+  "version": 2,
+  "name": "example.bin",
+  "entries": [
+    {"id": "<sha256-hex>", "size": 123,
+     "x-tags": ["hot", "audit"],
+     "x-meta": {"nested": {"deep": true}, "list": [1, 2, 3], "empty": null},
+     "x-big": 9007199254740993}
+  ],
+  "x-object-level": {"policy": "keep", "quorum": 7}
+}
+```
+
+约定与保证：
+
+1. **原样保留**：程序不认识的字段一律原样保留（嵌套对象、数组、布尔、null
+   皆可），`Marshal` 时原样输出。读取 → 修改某个已知字段 → 写回后，两级扩展
+   中所有未触碰的内容都与原来一致，绝不会因为不认识而被静默删除或改写
+   （`TestChunkExtensionsLosslessRoundTrip`、
+   `TestChunkExtensionsEndToEndReadModifyWrite`）。
+2. **大整数逐位精确**：解析使用 `json.Decoder.UseNumber()`，数字以
+   `json.Number` 持有，不经过 `float64`，因此超过 `2^53`（甚至几十位）的
+   整数逐位不变、不会变成近似值；序列化时也按原数字文本输出
+   （`TestLargeIntegersExactAcrossRewrite`）。需要按整数使用内建 `size` /
+   `version` 时才做精确整数转换，非整数一律判为非法。
+3. **可复现**：map 键按固定顺序输出；同一份清单重复序列化字节一致，
+   “原样再写”与“先读出再写回”产生的字节和清单内容标识（manifest ID）都相同
+   （`TestSerializationAndContentIDReproducible`）。
+4. **命名空间约定**：内建字段名（顶层 `version`/`name`/`entries`，条目
+   `id`/`size`）保留给本格式；保留字段若与内建字段同名会被判为
+   `manifest.ErrInvalidManifest`，避免伪装成内建字段。上层工具自定义字段
+   建议自带前缀（示例中使用 `x-`）以免与未来内建字段冲突。
+5. **扩展随副本复制与修复**：扩展是清单字节的一部分，而清单本身按内容寻址、
+   作为普通块参与副本放置、读修复与后台修复；因此节点宕机 / 丢副本恢复后，
+   各副本上恢复出的是**逐字节相同**、扩展完整的清单
+   （`TestExtensionsSurviveNodeOutageAndRepair`）。
+
+### 并发读改写（`UpdateObject`）
+
+- `network.UpdateObject(ctx, name, opt, mutator)` 在**同一对象名**上串行化：
+  内部按对象名加锁，先重新读取该对象最新已提交的清单头（object head），
+  应用 `mutator` 改动，校验并把新清单作为新的内容寻址块写入，再推进头指针。
+  多个写入方并发读改写时，每个写入方看到的都是此前最新版本，扩展互相追加而
+  不会覆盖丢失（`TestConcurrentReadModifyWriteNoLostExtensions`，
+  `-race` 下反复运行）。
+- 新清单写不满副本因子时返回 `ErrNotEnoughReplicas`、**不推进头指针**；旧的
+  已确认清单仍可读，节点恢复后重试即可，扩展不丢
+  （`TestUpdateObjectFailureDoesNotAdvanceHead`、
+  `TestConcurrentUpdatesDuringNodeFlap`）。
+- 头指针注册表是**本网络实例内**的并发控制；跨进程的独立网络实例之间不共享
+  头指针（磁盘上的清单块与扩展本身仍然完整、可按 manifest ID 直接读取）。
+
+## 4. 版本兼容策略（清单）
 
 清单是 JSON 对象，当前版本常量：
 
 ```
-manifest.MinVersion = 1, manifest.CurrentVersion = 1, manifest.MaxSupportedVersion = 1
+manifest.MinVersion = 1, manifest.CurrentVersion = 2, manifest.MaxSupportedVersion = 2
 ```
 
-规则（代码与测试一一对应）：
+版本含义：v1 = `{version,name,entries:[{id,size}]}`（加顶层保留字段）；
+v2 在 v1 基础上允许每个 `entries[]` 元素携带自己的块级扩展字段。规则（代码与测试一一对应）：
 
 1. **旧版可读**：`version` 缺失视为 1（遗留数据），`MinVersion <=
    version <= MaxSupportedVersion` 的数据始终可读
    （`TestLegacyManifestReadable`）。
 2. **未来版本拒绝**：`version > MaxSupportedVersion` 返回
-   `manifest.ErrUnsupportedVersion`，不做“半懂”的解析，更不会静默重写
-   （`TestFutureManifestRejected`）。
-3. **未知字段保留**：读取时把所有非内建字段原样保存在 `Manifest.Unknown`，
-   `Marshal` 时原样输出；**读—改—写不会丢弃其他/更新版本写入的信息**
-   （`TestUnknownFieldsPreservedOnReadModifyWrite`）。
+   `manifest.ErrUnsupportedVersion`，不做“半懂”的解析，更不会静默重写——即使
+   里面的扩展字段看起来眼熟（`TestFutureManifestRejected`、
+   `TestFutureVersionStillRejectedWithExtensions`）。
+3. **未知字段保留**：读取时把对象级非内建字段保存在 `Manifest.Unknown`、
+   块级非内建字段保存在 `Entry.Unknown`，`Marshal` 时原样输出；**读—改—写不
+   会丢弃其他/更新版本写入的信息**（顶层：
+   `TestUnknownFieldsPreservedOnReadModifyWrite`；块级：
+   `TestChunkExtensionsLosslessRoundTrip`）。
 4. **升级幂等**：`Upgrade` 将受支持的旧版本就地提升到 `CurrentVersion`，
-   保留全部条目与未知字段，重复调用结果相同。
+   保留全部条目与两级扩展；v1 数据升级到 v2 后重复升级结果逐字节相同
+   （`TestUpgradeIdempotentAndLossless`、
+   `TestUpgradeV1ToV2KeepsEverything`）。
 5. **非法输入分类**：JSON 语法错误、字段类型错误、条目缺 ID、负尺寸等
    统一归类为 `manifest.ErrInvalidManifest`，错误消息说明具体位置。
-6. 序列化按键排序，相同清单产生字节稳定的输出，因此清单 ID 稳定。
+6. 序列化按键排序、数字按原文输出，相同清单产生字节稳定的输出，因此
+   清单 ID 稳定。
 
-## 4. 本地验证方法
+## 5. 本地验证方法
 
 需要 Go 1.25+（见 `go.mod`），无需任何外部服务 / 网络 / 数据库。
 
@@ -139,7 +212,14 @@ go test ./pkg/network -v
 # 并发安全 + 重复运行一致性
 go test -race -count=10 ./...
 
-# 一键端到端演示（写入 5 节点 / RF=3 → 副本损坏+节点下线 → 恢复 → 收敛）
+# 只跑本次新增的扩展 / 大整数 / 并发读改写 / 故障恢复用例
+go test ./pkg/manifest -v -run 'ChunkExtensions|LargeIntegers|SerializationAndContentID|UpgradeV1|FutureVersionStill'
+go test ./pkg/network  -v -run 'ChunkExtensionsEndToEnd|ConcurrentReadModifyWrite|ExtensionsSurviveNodeOutage|UpdateObjectFailure|ConcurrentUpdatesDuringNodeFlap'
+
+# 确认既有用例（读写、修复、版本兼容）无回归
+go test -count=1 ./...
+
+# 一键端到端演示（写入 5 节点 / RF=3 → 读改写加块级扩展 → 副本损坏+节点下线 → 恢复 → 收敛）
 go run ./cmd/cas-demo
 ```
 
@@ -164,6 +244,13 @@ opt := network.Options{Replication: 3, ChunkSize: 64 * 1024}
 
 manifestID, _, err := net.PutObject(ctx, "file.bin", data, opt)
 payload, _, err := net.GetObject(ctx, manifestID, opt)
+
+// 原子读改写：给对象和第一个数据块附加扩展（大整数用 json.Number）。
+newID, _, err := net.UpdateObject(ctx, "file.bin", opt, func(m *manifest.Manifest) error {
+	m.Unknown["x-owner"] = "tool-a"
+	m.Entries[0].Unknown["x-checksum"] = json.Number("123456789012345678901234567890")
+	return nil
+})
 
 go net.RepairLoop(ctx, time.Second, opt) // 后台修复
 ```
