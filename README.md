@@ -8,14 +8,16 @@ Storage, CAS）网络，用于验证：
 - 多个本地存储节点之间的副本写入、读取、读修复与后台修复；
 - 并发写入 / 读取与节点短暂不可用同时发生时，已确认写入不丢失、副本计数
   不虚高，节点恢复后各副本收敛一致；
-- 内容清单（manifest）版本演进的向后 / 向前兼容，读改写不静默丢信息。
+- 内容清单（manifest）版本演进的向后 / 向前兼容，读改写不静默丢信息；
+- 清单级与**每个数据块级**的自定义扩展信息（可嵌套、可携带任意大整数），
+  在读改写、并发写入与节点故障恢复中逐位保留。
 
 ## 目录结构
 
 | 路径 | 职责 |
 | --- | --- |
 | `pkg/chunk` | 确定性定长切分、SHA-256 内容标识、载荷校验 |
-| `pkg/manifest` | 版本化内容清单，JSON 编解码、兼容规则、未知字段保留 |
+| `pkg/manifest` | 版本化内容清单（v1/v2），JSON 编解码、兼容规则、顶层与块级扩展/未知字段保留、大整数无损 |
 | `pkg/store` | 单节点磁盘存储：原子写、读时重算哈希、可用性开关 |
 | `pkg/network` | 多节点副本放置、仲裁写、读修复、后台修复循环 |
 | `cmd/cas-demo` | 一键本地端到端演示（写入 → 故障 → 恢复 → 收敛） |
@@ -105,8 +107,14 @@ Storage, CAS）网络，用于验证：
 清单是 JSON 对象，当前版本常量：
 
 ```
-manifest.MinVersion = 1, manifest.CurrentVersion = 1, manifest.MaxSupportedVersion = 1
+manifest.MinVersion = 1, manifest.CurrentVersion = 2, manifest.MaxSupportedVersion = 2
 ```
+
+| 版本 | 状态 |
+| --- | --- |
+| v1（`version` 缺失也视为 v1） | 可读；`Upgrade` 后就地升级到 v2 |
+| v2（当前） | 本程序读写的版本；条目支持块级扩展 `attrs` |
+| v3+ | 拒绝（`manifest.ErrUnsupportedVersion`） |
 
 规则（代码与测试一一对应）：
 
@@ -115,15 +123,78 @@ manifest.MinVersion = 1, manifest.CurrentVersion = 1, manifest.MaxSupportedVersi
    （`TestLegacyManifestReadable`）。
 2. **未来版本拒绝**：`version > MaxSupportedVersion` 返回
    `manifest.ErrUnsupportedVersion`，不做“半懂”的解析，更不会静默重写
-   （`TestFutureManifestRejected`）。
-3. **未知字段保留**：读取时把所有非内建字段原样保存在 `Manifest.Unknown`，
-   `Marshal` 时原样输出；**读—改—写不会丢弃其他/更新版本写入的信息**
-   （`TestUnknownFieldsPreservedOnReadModifyWrite`）。
+   （`TestFutureManifestRejected`、`TestAttrsRejectionRules`）。
+3. **未知字段保留**：读取时把所有非内建字段原样保存在 `Manifest.Unknown`
+   （顶层）和 `Entry.Unknown`（条目内），`Marshal` 时原样输出；
+   **读—改—写不会丢弃其他/更新版本写入的信息**
+   （`TestUnknownFieldsPreservedOnReadModifyWrite`、
+   `TestChunkAttrsLosslessRoundTrip`）。
 4. **升级幂等**：`Upgrade` 将受支持的旧版本就地提升到 `CurrentVersion`，
-   保留全部条目与未知字段，重复调用结果相同。
-5. **非法输入分类**：JSON 语法错误、字段类型错误、条目缺 ID、负尺寸等
-   统一归类为 `manifest.ErrInvalidManifest`，错误消息说明具体位置。
+   保留全部条目、块级扩展与未知字段；v1 清单升级到 v2 后重复升级字节完全
+   相同（`TestUpgradeIdempotentAndLossless`、
+   `TestUpgradeV1ToV2LosslessAndIdempotent`）。
+5. **非法输入分类**：JSON 语法错误、字段类型错误、条目缺 ID、负尺寸、
+   `attrs` 不是对象等统一归类为 `manifest.ErrInvalidManifest`，错误消息
+   说明具体位置。
 6. 序列化按键排序，相同清单产生字节稳定的输出，因此清单 ID 稳定。
+
+## 3.1 扩展信息（清单级与块级）
+
+不同上层工具可以往清单里挂自己的附加信息，分两级：
+
+- **清单级**：`manifest.Manifest.Unknown map[string]any`，即清单对象上除
+  `version` / `name` / `entries` 之外的任意字段；通过
+  `network.Options.Extensions` 在 `PutObject` 时写入。
+- **数据块级**：每个条目上的 `attrs` 对象
+  （`manifest.Entry.Attrs map[string]any`），与该块一一对应；通过
+  `network.Options.ChunkAttrs`（按块顺序、每块一个 map，长度必须与块数
+  相同）写入。条目上除 `id` / `size` / `attrs` 外的其他字段由
+  `Entry.Unknown` 原样保留。
+
+线上 JSON 形如：
+
+```json
+{
+  "version": 2,
+  "name": "example.txt",
+  "x-tool-policy": {"k": 123},
+  "entries": [
+    {
+      "id": "ab12…",
+      "size": 65536,
+      "attrs": {
+        "x-source": {"offset": "0010", "n": 123456789012345678901234567890},
+        "tags": ["a", true, null, -7]
+      },
+      "x-entry-note": "preserved-too"
+    }
+  ]
+}
+```
+
+取值与精度规则：
+
+- 值可以是**嵌套对象、数组、字符串、布尔、null**，以及**任意大小的整数**。
+- 解析使用 `json.Decoder.UseNumber`：所有数字以原始数字文本
+  （`json.Number`）保存，**不经过 float64**，因此远超 2^53 的大整数
+  逐位保持不变，不会变成近似值（`TestChunkAttrsLosslessRoundTrip`、
+  `TestBigIntFromAPISerializedDigitForDigit`）。
+- 程序侧构造扩展值时可以直接放 `*big.Int`、`json.Number` 或内建整数
+  类型，`Marshal` 会把它们序列化成**裸 JSON 数字**（不是字符串）；
+  不支持 JSON 的类型（如 channel）返回 `ErrInvalidManifest`，不会被
+  悄悄改写。
+- 读改写：`GetObject` 拿到的 `*manifest.Manifest` 可直接修改已知字段或
+  扩展字段，再用 `network.PutManifest(ctx, man, opt)` 写回。内容寻址
+  保证旧版本永不被覆盖；扩展信息（含大整数、嵌套结构、null、空 attrs
+  对象）在重新读出后与写入语义一致，重复序列化字节相同，故清单内容
+  标识可复现。
+- 并发：多个写入方对同一对象做读改写时，应按“读最新清单 → 合并自己的
+  扩展 → `PutManifest` → 失败/落后则重试”的乐观 CAS 方式进行；写入只在
+  副本集合全部确认后才算成功，未确认不计数、不覆盖。已确认的每个清单
+  版本及其数据块在节点恢复后由读修复 / 后台修复补齐到副本因子，
+  **各写入方的扩展字段不会互相覆盖或丢失**
+  （`TestConcurrentReadModifyWritePreservesExtensions`、
+  `TestExtensionsSurviveNodeOutageAndRecovery`）。
 
 ## 4. 本地验证方法
 
@@ -139,7 +210,11 @@ go test ./pkg/network -v
 # 并发安全 + 重复运行一致性
 go test -race -count=10 ./...
 
-# 一键端到端演示（写入 5 节点 / RF=3 → 副本损坏+节点下线 → 恢复 → 收敛）
+# 只看本次新增的重点用例
+go test -v ./pkg/manifest -run 'ChunkAttrs|BigInt|Upgrade'
+go test -race -v ./pkg/network -run 'ChunkAttrs|ReadModifyWrite|Outage'
+
+# 一键端到端演示（写入 5 节点 / RF=3，携带清单级与块级扩展和大整数 → 副本损坏+节点下线 → 恢复 → 收敛）
 go run ./cmd/cas-demo
 ```
 
@@ -160,10 +235,22 @@ go run ./cmd/cas-demo
 ```go
 nodes := // ...store.New(id, dir)...
 net := network.New(nodes...)
-opt := network.Options{Replication: 3, ChunkSize: 64 * 1024}
+opt := network.Options{
+	Replication: 3,
+	ChunkSize:   64 * 1024,
+	// Object-level extensions (arbitrary JSON, huge ints via json.Number / *big.Int).
+	Extensions: map[string]any{"x-author": "tool-a", "x-epoch": json.Number("1700000000000000")},
+	// One attrs map per chunk, in chunk order.
+	ChunkAttrs: []map[string]any{{"x-kind": "head"}, {"x-kind": "body"}},
+}
 
 manifestID, _, err := net.PutObject(ctx, "file.bin", data, opt)
-payload, _, err := net.GetObject(ctx, manifestID, opt)
+payload, man, err := net.GetObject(ctx, manifestID, opt)
+
+// Read-modify-write: edit, then persist the manifest as a new content ID;
+// all unknown/extension fields survive automatically.
+man.Unknown["x-reviewed"] = true
+newID, err := net.PutManifest(ctx, man, opt)
 
 go net.RepairLoop(ctx, time.Second, opt) // 后台修复
 ```

@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"testing"
@@ -90,7 +91,7 @@ func TestUnknownFieldsSurviveReadModifyWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if re.Unknown["x-encryption"] != "aes-9000" || re.Unknown["x-quorum"].(float64) != 7 {
+	if re.Unknown["x-encryption"] != "aes-9000" || re.Unknown["x-quorum"] != json.Number("7") {
 		t.Fatalf("read-modify-write silently dropped fields: %s", out)
 	}
 	t.Logf("manifest-id=%s preserved-fields=%v basis=unknown-fields-verbatim-round-trip",

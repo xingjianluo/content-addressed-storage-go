@@ -12,11 +12,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/xingjianluo/content-addressed-storage-go/pkg/chunk"
@@ -50,7 +52,17 @@ func main() {
 	}
 	net := network.New(nodes...)
 	net.SetLogger(stdLogger{})
-	opt := network.Options{Replication: rf, ChunkSize: 64}
+	opt := network.Options{
+		Replication: rf,
+		ChunkSize:   64,
+		// Object-level custom extension information.
+		Extensions: map[string]any{
+			"x-author":   "cas-demo",
+			"x-epoch-us": json.Number("1700000000000000"),
+			"x-features": []any{"block-attrs", true, nil},
+			"x-big-int":  json.Number("1234567890123456789012345678901234567890"),
+		},
+	}
 
 	// 1) Write an object spanning multiple chunks.
 	payload := []byte("content-addressed storage demo: ")
@@ -58,18 +70,34 @@ func main() {
 	for i := 64; i < len(payload); i++ {
 		payload[i] = byte(i % 251)
 	}
+	// Per-chunk custom extension information, one attrs object per chunk,
+	// including integers far beyond float64 precision.
+	parts := len(payload) / opt.ChunkSize
+	if len(payload)%opt.ChunkSize != 0 {
+		parts++
+	}
+	opt.ChunkAttrs = make([]map[string]any, parts)
+	for i := range opt.ChunkAttrs {
+		opt.ChunkAttrs[i] = map[string]any{
+			"x-source-tool": "demo-tool",
+			"x-chunk-index": json.Number(strconv.Itoa(i)),
+			"x-big-int":     json.Number("9999999999999999999999999999999999999999"),
+		}
+	}
 	manifestID, man, err := net.PutObject(ctx, "demo.bin", payload, opt)
 	if err != nil {
 		log.Fatalf("put object: %v", err)
 	}
-	fmt.Printf("WROTE manifest=%s version=%d chunks=%d\n", manifestID, man.Version, len(man.Entries))
+	fmt.Printf("WROTE manifest=%s version=%d chunks=%d extensions=%d chunk-attrs/chunk=%d\n",
+		manifestID, man.Version, len(man.Entries), len(man.Unknown), len(man.Entries[0].Attrs))
 
 	// 2) Read it back and compare.
-	got, _, err := net.GetObject(ctx, manifestID, opt)
+	got, readMan, err := net.GetObject(ctx, manifestID, opt)
 	if err != nil || string(got) != string(payload) {
 		log.Fatalf("read-back mismatch: %v", err)
 	}
-	fmt.Println("READ-OK identical bytes reconstructed from verified chunks")
+	fmt.Printf("READ-OK identical bytes; extensions preserved (x-big-int=%v, first-chunk attrs=%d keys)\n",
+		readMan.Unknown["x-big-int"], len(readMan.Entries[0].Attrs))
 
 	// 3) Start background repair, then take one replica down and lose data
 	//    on another, to be recovered when they return.

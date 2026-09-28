@@ -61,6 +61,13 @@ type Options struct {
 	Replication int
 	// ChunkSize overrides the default split size for objects.
 	ChunkSize int
+	// Extensions holds object-level custom extension fields stored on the
+	// manifest itself. Nested objects/arrays, booleans, nil and large
+	// integers (*big.Int / json.Number) are preserved losslessly.
+	Extensions map[string]any
+	// ChunkAttrs holds per-chunk extension fields; it must either be empty
+	// or have exactly one entry per produced chunk (in chunk order).
+	ChunkAttrs []map[string]any
 }
 
 func (o Options) replication() int {
@@ -210,6 +217,10 @@ func (n *Network) GetChunk(ctx context.Context, id chunk.ID, opt Options) (chunk
 			corruptNodes = append(corruptNodes, o.node.ID())
 		case errors.Is(err, store.ErrUnavailable):
 			unavailableNodes = append(unavailableNodes, o.node.ID())
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			// A canceled/deadline request never proves the node is up;
+			// treat it like an unreachable node, not like "missing".
+			unavailableNodes = append(unavailableNodes, o.node.ID())
 		case errors.Is(err, store.ErrNotFound):
 			contacted++
 			missingNodes = append(missingNodes, o.node.ID())
@@ -263,34 +274,71 @@ func (n *Network) GetChunk(ctx context.Context, id chunk.ID, opt Options) (chunk
 // PutObject splits content deterministically, writes every chunk with
 // replication, then writes the manifest itself as a content-addressed
 // chunk. The returned ID identifies the serialized manifest.
+//
+// opt.Extensions (object-level) and opt.ChunkAttrs (one attrs object per
+// chunk in order) are attached to the manifest and preserved losslessly.
 func (n *Network) PutObject(ctx context.Context, name string, data []byte, opt Options) (chunk.ID, *manifest.Manifest, error) {
 	size := opt.ChunkSize
 	if size <= 0 {
 		size = chunk.DefaultSplitSize
 	}
 	parts := chunk.Split(data, size)
+	if len(opt.ChunkAttrs) > 0 && len(opt.ChunkAttrs) != len(parts) {
+		return "", nil, fmt.Errorf("network: ChunkAttrs count %d does not match chunk count %d",
+			len(opt.ChunkAttrs), len(parts))
+	}
 
 	man := &manifest.Manifest{
 		Version: manifest.CurrentVersion,
 		Name:    name,
 		Entries: make([]manifest.Entry, 0, len(parts)),
+		Unknown: cloneExt(opt.Extensions),
 	}
-	for _, c := range parts {
+	for i, c := range parts {
 		if _, err := n.PutChunk(ctx, c, opt); err != nil {
 			return "", nil, err
 		}
-		man.Entries = append(man.Entries, manifest.Entry{ID: c.ID, Size: len(c.Data)})
+		e := manifest.Entry{ID: c.ID, Size: len(c.Data)}
+		if i < len(opt.ChunkAttrs) && len(opt.ChunkAttrs[i]) > 0 {
+			e.Attrs = cloneExt(opt.ChunkAttrs[i])
+		}
+		man.Entries = append(man.Entries, e)
 	}
 
-	raw, err := manifest.Marshal(man)
+	id, err := n.PutManifest(ctx, man, opt)
 	if err != nil {
 		return "", nil, err
 	}
+	return id, man, nil
+}
+
+// PutManifest serializes and writes an already-built manifest (including
+// any object-level and per-chunk extensions) as a content-addressed
+// chunk. It is the write side of a read-modify-write cycle: fetch with
+// GetObject, edit the returned manifest, then persist via PutManifest.
+func (n *Network) PutManifest(ctx context.Context, man *manifest.Manifest, opt Options) (chunk.ID, error) {
+	raw, err := manifest.Marshal(man)
+	if err != nil {
+		return "", err
+	}
 	mc := chunk.Chunk{ID: chunk.ComputeID(raw), Data: raw}
 	if _, err := n.PutChunk(ctx, mc, opt); err != nil {
-		return "", nil, err
+		return "", err
 	}
-	return mc.ID, man, nil
+	return mc.ID, nil
+}
+
+// cloneExt shallow-copies an extension map so caller-owned maps are never
+// shared/mutated; nested values are treated as immutable after handoff.
+func cloneExt(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 // GetObject fetches the manifest chunk, applies manifest compatibility

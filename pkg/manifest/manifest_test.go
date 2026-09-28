@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -33,7 +34,7 @@ func TestRoundTripStable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Name != m.Name || len(got.Entries) != 2 || got.Version != 1 {
+	if got.Name != m.Name || len(got.Entries) != 2 || got.Version != CurrentVersion {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}
 	id1, _ := ContentID(m)
@@ -83,7 +84,7 @@ func TestUnknownFieldsPreservedOnReadModifyWrite(t *testing.T) {
 	if m.Unknown["x-new-policy"] != "keep-me" {
 		t.Fatalf("unknown string field lost: %+v", m.Unknown)
 	}
-	if m.Unknown["x-replicas"].(float64) != 5 {
+	if m.Unknown["x-replicas"] != json.Number("5") {
 		t.Fatalf("unknown number field lost: %+v", m.Unknown)
 	}
 	// Modify a known field, then re-marshal: unknown fields must survive.
@@ -127,7 +128,7 @@ func TestUpgradeIdempotentAndLossless(t *testing.T) {
 	if up.Version != CurrentVersion {
 		t.Fatalf("upgrade version=%d", up.Version)
 	}
-	if up.Unknown["keep"].(float64) != 1 {
+	if up.Unknown["keep"] != json.Number("1") {
 		t.Fatalf("upgrade dropped unknown field")
 	}
 	again := Upgrade(up)
