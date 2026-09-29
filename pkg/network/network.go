@@ -29,6 +29,9 @@ type Network struct {
 	sorted []*store.Store
 
 	logger Logger
+	// cas coordinates concurrent read-modify-write cycles so distinct
+	// extensions from multiple writers merge instead of overwriting.
+	cas *casCoordinator
 }
 
 // Logger receives human-readable, test-inspectable decisions.
@@ -44,7 +47,7 @@ func (discardLogger) Logf(string, ...any) {}
 func New(nodes ...*store.Store) *Network {
 	sorted := append([]*store.Store(nil), nodes...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID() < sorted[j].ID() })
-	return &Network{nodes: nodes, sorted: sorted, logger: discardLogger{}}
+	return &Network{nodes: nodes, sorted: sorted, logger: discardLogger{}, cas: newCASCoordinator()}
 }
 
 // SetLogger installs a decision logger (e.g. a test logger).
@@ -299,8 +302,11 @@ func (n *Network) PutObject(ctx context.Context, name string, data []byte, opt O
 			return "", nil, err
 		}
 		e := manifest.Entry{ID: c.ID, Size: len(c.Data)}
-		if i < len(opt.ChunkAttrs) && len(opt.ChunkAttrs[i]) > 0 {
-			e.Attrs = cloneExt(opt.ChunkAttrs[i])
+		if i < len(opt.ChunkAttrs) && opt.ChunkAttrs[i] != nil {
+			attrs := cloneExt(opt.ChunkAttrs[i])
+			e.Attrs = attrs
+			// A non-nil map (even when empty) is an explicit "attrs": {}.
+			e.SetAttrsForm(manifest.AttrsObject)
 		}
 		man.Entries = append(man.Entries, e)
 	}
@@ -330,8 +336,10 @@ func (n *Network) PutManifest(ctx context.Context, man *manifest.Manifest, opt O
 
 // cloneExt shallow-copies an extension map so caller-owned maps are never
 // shared/mutated; nested values are treated as immutable after handoff.
+// A non-nil empty map is preserved (it denotes an explicit "{}", distinct
+// from an absent/null extension).
 func cloneExt(in map[string]any) map[string]any {
-	if len(in) == 0 {
+	if in == nil {
 		return nil
 	}
 	out := make(map[string]any, len(in))

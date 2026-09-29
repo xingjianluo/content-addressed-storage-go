@@ -17,9 +17,9 @@ Storage, CAS）网络，用于验证：
 | 路径 | 职责 |
 | --- | --- |
 | `pkg/chunk` | 确定性定长切分、SHA-256 内容标识、载荷校验 |
-| `pkg/manifest` | 版本化内容清单（v1/v2），JSON 编解码、兼容规则、顶层与块级扩展/未知字段保留、大整数无损 |
+| `pkg/manifest` | 版本化内容清单（v1/v2），保序 JSON 编解码、兼容规则、顶层与块级扩展/未知字段保留（缺省/null/`{}` 三态区分、键序保留、大整数无损）、三路合并 |
 | `pkg/store` | 单节点磁盘存储：原子写、读时重算哈希、可用性开关 |
-| `pkg/network` | 多节点副本放置、仲裁写、读修复、后台修复循环 |
+| `pkg/network` | 多节点副本放置、仲裁写、读修复、后台修复循环、并发读改写的协调式 CAS（lineage 头指针 + 三路合并） |
 | `cmd/cas-demo` | 一键本地端到端演示（写入 → 故障 → 恢复 → 收敛） |
 
 ## 1. 内容标识与完整性规则
@@ -122,17 +122,21 @@ manifest.MinVersion = 1, manifest.CurrentVersion = 2, manifest.MaxSupportedVersi
    version <= MaxSupportedVersion` 的数据始终可读
    （`TestLegacyManifestReadable`）。
 2. **未来版本拒绝**：`version > MaxSupportedVersion` 返回
-   `manifest.ErrUnsupportedVersion`，不做“半懂”的解析，更不会静默重写
-   （`TestFutureManifestRejected`、`TestAttrsRejectionRules`）。
+   `manifest.ErrUnsupportedVersion`，不做“半懂”的解析，更不会静默重写；
+   即使新版本数据里用了 `"attrs": null` 等本程序认识的形态，也一律拒绝
+   （`TestFutureManifestRejected`、
+   `TestFutureVersionWithNullAttrsRejected`、`TestAttrsRejectionRules`）。
 3. **未知字段保留**：读取时把所有非内建字段原样保存在 `Manifest.Unknown`
    （顶层）和 `Entry.Unknown`（条目内），`Marshal` 时原样输出；
    **读—改—写不会丢弃其他/更新版本写入的信息**
    （`TestUnknownFieldsPreservedOnReadModifyWrite`、
    `TestChunkAttrsLosslessRoundTrip`）。
 4. **升级幂等**：`Upgrade` 将受支持的旧版本就地提升到 `CurrentVersion`，
-   保留全部条目、块级扩展与未知字段；v1 清单升级到 v2 后重复升级字节完全
-   相同（`TestUpgradeIdempotentAndLossless`、
-   `TestUpgradeV1ToV2LosslessAndIdempotent`）。
+   保留全部条目、块级扩展（含缺省/`null`/`{}` 三种 attrs 形态）与未知
+   字段；v1 清单升级到 v2 后重复升级字节完全相同
+   （`TestUpgradeIdempotentAndLossless`、
+   `TestUpgradeV1ToV2LosslessAndIdempotent`、
+   `TestUpgradePreservesAttrsShapes`）。
 5. **非法输入分类**：JSON 语法错误、字段类型错误、条目缺 ID、负尺寸、
    `attrs` 不是对象等统一归类为 `manifest.ErrInvalidManifest`，错误消息
    说明具体位置。
@@ -150,6 +154,43 @@ manifest.MinVersion = 1, manifest.CurrentVersion = 2, manifest.MaxSupportedVersi
   `network.Options.ChunkAttrs`（按块顺序、每块一个 map，长度必须与块数
   相同）写入。条目上除 `id` / `size` / `attrs` 外的其他字段由
   `Entry.Unknown` 原样保留。
+
+### 数据块级 attrs 的三种形态（彼此区分、原样往返）
+
+线上条目上的 `attrs` 有三种**语义不同**的形态，编解码时用
+`Entry.AttrsForm()`（`AttrsOmitted` / `AttrsNull` / `AttrsObject`）区分，
+读改写后不会被混成同一种结果：
+
+| 线上形态 | 含义 | 读改写后 |
+| --- | --- | --- |
+| 没有 `attrs` 键（缺省） | 该块从未携带扩展 | 仍然完全不带该键 |
+| `"attrs": null` | 由其他工具写入的**明确空值** | 仍然原样输出 `"attrs":null` |
+| `"attrs": {}` 或带键对象 | 显式空对象 / 有扩展 | 仍然是对象（空对象不塌缩成缺省） |
+
+`attrs` 对象内部某个键的**显式 null 值**（如 `"x":null`）同样逐字保留，
+不会因为值是 null 就把该键删掉。程序侧用 `Entry.SetAttr(k, v)` 加键会
+自动把缺省/null 形态提升为对象形态；`Entry.SetAttrsForm(...)` 可显式设置
+形态（null 形态不允许同时藏有键，否则 `Marshal` 返回
+`ErrInvalidManifest`）。
+
+### 键顺序与“逐字节 + 内容标识”保留
+
+- 解码使用自定义的保序 JSON 解码器（数字仍走
+  `json.Decoder.UseNumber`），记录每个对象（含 attrs、嵌套对象、清单级
+  未知字段）在**线上原始字节中的键顺序**。
+- 序列化时内建字段按固定 schema 顺序输出（清单：`version`、`name`、
+  `entries`；条目：`id`、`size`、`attrs`），其余所有键**按解码到的原始
+  顺序**输出；新加的键按字典序追加在原有键之后。
+- 因此，把别的工具写出的清单读出来、**只改一个已知字段再写回**时，所有
+  未被改动的部分（包括缺省/`null`/`{}` 三种 attrs 形态、嵌套结构、
+  null 值、键顺序）产出的序列化字节与原文一致，清单内容标识
+  （`SHA-256(序列化字节)`）也一致、可复现
+  （`TestChunkAttrsPresenceByteStableEndToEnd`、
+  `TestAttrsPresenceShapesRoundTrip`、
+  `TestAttrsNullValueInsideObjectPreserved`）。
+- 说明：本程序输出的是**紧凑 JSON**（无多余空白）。对外来清单的“原样”是
+  语义与字节布局（键顺序、形态、数字逐位）意义上的原样；若外来字节带
+  额外空白，首次经本程序读改写后会规范化为紧凑形式，之后即稳定可复现。
 
 线上 JSON 形如：
 
@@ -185,15 +226,36 @@ manifest.MinVersion = 1, manifest.CurrentVersion = 2, manifest.MaxSupportedVersi
   悄悄改写。
 - 读改写：`GetObject` 拿到的 `*manifest.Manifest` 可直接修改已知字段或
   扩展字段，再用 `network.PutManifest(ctx, man, opt)` 写回。内容寻址
-  保证旧版本永不被覆盖；扩展信息（含大整数、嵌套结构、null、空 attrs
-  对象）在重新读出后与写入语义一致，重复序列化字节相同，故清单内容
-  标识可复现。
-- 并发：多个写入方对同一对象做读改写时，应按“读最新清单 → 合并自己的
-  扩展 → `PutManifest` → 失败/落后则重试”的乐观 CAS 方式进行；写入只在
-  副本集合全部确认后才算成功，未确认不计数、不覆盖。已确认的每个清单
-  版本及其数据块在节点恢复后由读修复 / 后台修复补齐到副本因子，
-  **各写入方的扩展字段不会互相覆盖或丢失**
-  （`TestConcurrentReadModifyWritePreservesExtensions`、
+  保证旧版本永不被覆盖；扩展信息（含大整数、嵌套结构、null、三种 attrs
+  形态）在重新读出后与写入语义一致，**未改动时重复序列化字节相同**，故
+  清单内容标识可复现。
+- **并发读改写（多写入方扩展不互相覆盖）**：两个上层工具若都基于同一
+  版本各自加扩展、再直接 `PutManifest`，属于“最后写入者赢”，后写会盖掉
+  先写。要在并发下不丢扩展，应使用网络内置的协调式 CAS：
+  - `net.ModifyManifest(ctx, baseID, func(m) error{ …只改自己的扩展… }, opt)`
+    在每个对象的 lineage 上串行执行“读最新头 → 应用修改 → 确认写回”，
+    节点短暂不可用导致写未确认时自动重试，直到该轮写入被副本集合全部
+    确认。
+  - 已经持有完整清单对象的工具可用
+    `net.PutManifestCAS(ctx, baseID, man, opt)`：当 `baseID` 之后已有别的
+    工具提交了新版本，本程序以公共基版做**三路合并**
+    （`manifest.Merge(base, head, yours)`）——两边各自新增的扩展键都会
+    保留，同一个键被两边改成不同值才返回 `manifest.MergeConflict`
+    （不会静默二选一）；已知结构（名称、条目数/ID/顺序、size）的不兼容
+    并发修改同样报冲突。
+  - 头指针可经 `net.HeadManifestID(anyIDinLineage)` 查询。协调状态是
+    Network 实例内的进程内机制（本演示网络无外部协调服务）；底层内容
+    始终是不可变内容寻址块，未确认的写绝不会推进头指针。
+  - 对 `attrs` 三种形态的合并也保持区分：只有一边把缺省/null 改成对象，
+    结果就是对象；两边把同一 attrs 改成不同形态才冲突；未被任何一方
+    触碰的 `null` 条目保持 `null`。
+- 已确认的每个清单版本及其数据块仍是普通内容寻址块，在节点恢复后由读
+  修复 / 后台修复补齐到副本因子。**各写入方的扩展字段不会互相覆盖或
+  丢失，副本最终收敛一致**
+  （`TestCoordinatedRMWMergesConcurrentExtensions`、
+  `TestCoordinatedCASExplicitMerge`、
+  `TestCoordinatedMergeOnNullAttrs`、
+  `TestConcurrentReadModifyWritePreservesExtensions`、
   `TestExtensionsSurviveNodeOutageAndRecovery`）。
 
 ## 4. 本地验证方法
@@ -211,10 +273,10 @@ go test ./pkg/network -v
 go test -race -count=10 ./...
 
 # 只看本次新增的重点用例
-go test -v ./pkg/manifest -run 'ChunkAttrs|BigInt|Upgrade'
-go test -race -v ./pkg/network -run 'ChunkAttrs|ReadModifyWrite|Outage'
+go test -v ./pkg/manifest -run 'AttrsPresence|AttrsNull|ChunkAttrs|BigInt|Upgrade|Merge|FutureVersion'
+go test -race -v ./pkg/network -run 'ChunkAttrsPresence|Coordinated|ReadModifyWrite|Outage'
 
-# 一键端到端演示（写入 5 节点 / RF=3，携带清单级与块级扩展和大整数 → 副本损坏+节点下线 → 恢复 → 收敛）
+# 一键端到端演示（写入 5 节点 / RF=3，携带清单级与块级扩展和大整数 → 两个工具并发读改写叠加扩展（协调 CAS 合并） → 副本损坏+节点下线 → 恢复 → 收敛）
 go run ./cmd/cas-demo
 ```
 
@@ -251,6 +313,19 @@ payload, man, err := net.GetObject(ctx, manifestID, opt)
 // all unknown/extension fields survive automatically.
 man.Unknown["x-reviewed"] = true
 newID, err := net.PutManifest(ctx, man, opt)
+
+// Concurrent read-modify-write from multiple tools: attach only your own
+// keys; distinct keys from concurrent writers are three-way merged and
+// never overwrite each other. Unconfirmed writes (a node briefly down)
+// are retried until the full replica set acknowledges.
+newID, err = net.ModifyManifest(ctx, newID, func(m *manifest.Manifest) error {
+	m.Unknown["x-tool-a"] = "ok"
+	for i := range m.Entries {
+		m.Entries[i].SetAttr("x-tool-a", json.Number("42"))
+	}
+	return nil
+}, opt)
+head := net.HeadManifestID(newID)
 
 go net.RepairLoop(ctx, time.Second, opt) // 后台修复
 ```

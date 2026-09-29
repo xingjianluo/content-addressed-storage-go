@@ -19,9 +19,11 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/xingjianluo/content-addressed-storage-go/pkg/chunk"
+	"github.com/xingjianluo/content-addressed-storage-go/pkg/manifest"
 	"github.com/xingjianluo/content-addressed-storage-go/pkg/network"
 	"github.com/xingjianluo/content-addressed-storage-go/pkg/store"
 )
@@ -98,6 +100,39 @@ func main() {
 	}
 	fmt.Printf("READ-OK identical bytes; extensions preserved (x-big-int=%v, first-chunk attrs=%d keys)\n",
 		readMan.Unknown["x-big-int"], len(readMan.Entries[0].Attrs))
+
+	// 2b) Two independent tools concurrently read-modify-write the same
+	//     object, each attaching its own object-level and per-chunk
+	//     extensions. Coordinated CAS writes merge them: neither is lost.
+	head := manifestID
+	var wg sync.WaitGroup
+	for _, tool := range []string{"tool-a", "tool-b"} {
+		wg.Add(1)
+		go func(tool string) {
+			defer wg.Done()
+			_, err := net.ModifyManifest(ctx, head, func(m *manifest.Manifest) error {
+				m.Unknown["x-owner-"+tool] = "confirmed"
+				for i := range m.Entries {
+					m.Entries[i].SetAttr("x-owner-"+tool, json.Number("42"))
+				}
+				return nil
+			}, opt)
+			if err != nil {
+				log.Fatalf("coordinated RMW %s: %v", tool, err)
+			}
+		}(tool)
+	}
+	wg.Wait()
+	head = net.HeadManifestID(head)
+	_, mergedMan, err := net.GetObject(ctx, head, opt)
+	if err != nil {
+		log.Fatalf("read merged: %v", err)
+	}
+	if mergedMan.Unknown["x-owner-tool-a"] != "confirmed" || mergedMan.Unknown["x-owner-tool-b"] != "confirmed" {
+		log.Fatal("concurrent RMW lost an extension")
+	}
+	fmt.Printf("MERGE-OK two concurrent tools' extensions both present; head=%s entries=%d\n",
+		head, len(mergedMan.Entries))
 
 	// 3) Start background repair, then take one replica down and lose data
 	//    on another, to be recovered when they return.
