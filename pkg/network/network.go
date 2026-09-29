@@ -299,7 +299,9 @@ func (n *Network) PutObject(ctx context.Context, name string, data []byte, opt O
 			return "", nil, err
 		}
 		e := manifest.Entry{ID: c.ID, Size: len(c.Data)}
-		if i < len(opt.ChunkAttrs) && len(opt.ChunkAttrs[i]) > 0 {
+		if i < len(opt.ChunkAttrs) && opt.ChunkAttrs[i] != nil {
+			// A non-nil (even empty) attrs map is an explicit object form
+			// and is preserved as such; only a nil map means "absent".
 			e.Attrs = cloneExt(opt.ChunkAttrs[i])
 		}
 		man.Entries = append(man.Entries, e)
@@ -330,8 +332,10 @@ func (n *Network) PutManifest(ctx context.Context, man *manifest.Manifest, opt O
 
 // cloneExt shallow-copies an extension map so caller-owned maps are never
 // shared/mutated; nested values are treated as immutable after handoff.
+// A non-nil empty map stays a non-nil empty map so the explicit empty
+// object form is distinguishable from "absent".
 func cloneExt(in map[string]any) map[string]any {
-	if len(in) == 0 {
+	if in == nil {
 		return nil
 	}
 	out := make(map[string]any, len(in))

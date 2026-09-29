@@ -24,6 +24,17 @@
 // kept digit-for-digit; *big.Int and integer values supplied by callers
 // are serialized as JSON numbers without precision loss.
 //
+// The per-entry "attrs" field keeps its three wire forms distinct across
+// read-modify-write: absent (no key), explicit null ("attrs": null) and
+// object (including the empty object {}). An unmodified form round-trips
+// byte-for-byte, so the serialized bytes and the content ID of a manifest
+// are reproducible. See Entry.AttrsNull.
+//
+// Concurrent read-modify-write by multiple tools is reconciled with
+// MergeExtensions: confirmed extension keys from a losing writer's
+// manifest are unioned into the winner's (destination wins conflicts),
+// so no confirmed extension is silently dropped.
+//
 // Compatibility rules:
 //   - Data written by older versions (MinVersion <= Version < CurrentVersion)
 //     is always readable. A missing "version" field is treated as version 1.
@@ -68,7 +79,16 @@ type Entry struct {
 	// nested objects/arrays, strings, booleans, nil, json.Number or
 	// *big.Int. It is preserved verbatim (including large-integer digits)
 	// across read-modify-write cycles.
+	//
+	// The three wire forms are kept distinct:
+	//   - Attrs == nil && AttrsNull == false: the "attrs" key is absent;
+	//   - Attrs == nil && AttrsNull == true:  "attrs" is an explicit null;
+	//   - Attrs != nil (possibly empty):      "attrs" is a JSON object.
 	Attrs map[string]any
+	// AttrsNull records that the entry carried an explicit "attrs": null.
+	// It only takes effect while Attrs is nil; once Attrs is set to a
+	// non-nil map the object form wins and the null marker is ignored.
+	AttrsNull bool
 	// Unknown preserves entry-level fields this build does not know about.
 	Unknown map[string]any
 }
@@ -164,7 +184,8 @@ func Marshal(m *Manifest) ([]byte, error) {
 	entries := make([]map[string]any, 0, len(m.Entries))
 	for i, e := range m.Entries {
 		obj := map[string]any{"id": string(e.ID), "size": e.Size}
-		if e.Attrs != nil {
+		switch {
+		case e.Attrs != nil:
 			attrs := make(map[string]any, len(e.Attrs))
 			for k, v := range e.Attrs {
 				nv, err := normalizeExt(v)
@@ -174,6 +195,9 @@ func Marshal(m *Manifest) ([]byte, error) {
 				attrs[k] = nv
 			}
 			obj["attrs"] = attrs
+		case e.AttrsNull:
+			// An explicit null round-trips as an explicit null.
+			obj["attrs"] = nil
 		}
 		for k, v := range e.Unknown {
 			if _, known := knownEntryFields[k]; known {
@@ -260,7 +284,8 @@ func Unmarshal(data []byte) (*Manifest, error) {
 			e := Entry{ID: chunk.ID(idStr), Size: size}
 			if av, present := obj["attrs"]; present {
 				if av == nil {
-					e.Attrs = nil
+					// Explicit null is a distinct, preserved form.
+					e.AttrsNull = true
 				} else {
 					attrs, ok := av.(map[string]any)
 					if !ok {
@@ -305,6 +330,80 @@ func Upgrade(m *Manifest) *Manifest {
 	// All supported old versions map forward; unknown fields are kept.
 	m.Version = CurrentVersion
 	return m
+}
+
+// MergeExtensions folds the extension information of src into dst and
+// reports whether dst changed. It is the reconciliation step for
+// concurrent read-modify-write: two writers that both based their edit on
+// the same manifest version each produced a confirmed manifest; merging
+// the loser's manifest into the winner's (and re-persisting) guarantees
+// neither side's confirmed extensions are dropped.
+//
+// Rules (deterministic, dst wins on conflict):
+//   - Object-level: keys present in src.Unknown but missing in dst.Unknown
+//     are copied; keys already in dst are left untouched.
+//   - Entry-level: entries are paired by index and merged only when both
+//     manifests reference the same chunk ID at that index. Attrs keys are
+//     unioned (dst wins); a dst entry without any attrs form adopts src's
+//     form (object or explicit null). Entry.Unknown keys are unioned the
+//     same way.
+//
+// Known fields (Version, Name, ID, Size) are never touched. Merging is
+// idempotent: merging the same src twice changes nothing the second time.
+func MergeExtensions(dst, src *Manifest) bool {
+	if dst == nil || src == nil {
+		return false
+	}
+	changed := false
+	for k, v := range src.Unknown {
+		if _, ok := dst.Unknown[k]; ok {
+			continue
+		}
+		if dst.Unknown == nil {
+			dst.Unknown = map[string]any{}
+		}
+		dst.Unknown[k] = v
+		changed = true
+	}
+	n := len(dst.Entries)
+	if len(src.Entries) < n {
+		n = len(src.Entries)
+	}
+	for i := 0; i < n; i++ {
+		d, s := &dst.Entries[i], &src.Entries[i]
+		if d.ID != s.ID {
+			continue // different content: never mix per-chunk extensions
+		}
+		switch {
+		case d.Attrs != nil && s.Attrs != nil:
+			for k, v := range s.Attrs {
+				if _, ok := d.Attrs[k]; !ok {
+					d.Attrs[k] = v
+					changed = true
+				}
+			}
+		case d.Attrs == nil && !d.AttrsNull:
+			// dst carries no attrs form at all: adopt src's form verbatim.
+			if s.Attrs != nil {
+				d.Attrs = s.Attrs
+				changed = true
+			} else if s.AttrsNull {
+				d.AttrsNull = true
+				changed = true
+			}
+		}
+		for k, v := range s.Unknown {
+			if _, ok := d.Unknown[k]; ok {
+				continue
+			}
+			if d.Unknown == nil {
+				d.Unknown = map[string]any{}
+			}
+			d.Unknown[k] = v
+			changed = true
+		}
+	}
+	return changed
 }
 
 // ContentID returns the stable ID of a manifest's serialized form.

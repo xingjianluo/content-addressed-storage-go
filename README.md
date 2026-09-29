@@ -148,8 +148,9 @@ manifest.MinVersion = 1, manifest.CurrentVersion = 2, manifest.MaxSupportedVersi
 - **数据块级**：每个条目上的 `attrs` 对象
   （`manifest.Entry.Attrs map[string]any`），与该块一一对应；通过
   `network.Options.ChunkAttrs`（按块顺序、每块一个 map，长度必须与块数
-  相同）写入。条目上除 `id` / `size` / `attrs` 外的其他字段由
-  `Entry.Unknown` 原样保留。
+  相同）写入——某个位置给 `nil` 表示该块不带 `attrs` 键，给非 nil 的
+  空 map 则写入显式空对象 `{}`。条目上除 `id` / `size` / `attrs` 外的
+  其他字段由 `Entry.Unknown` 原样保留。
 
 线上 JSON 形如：
 
@@ -183,6 +184,14 @@ manifest.MinVersion = 1, manifest.CurrentVersion = 2, manifest.MaxSupportedVersi
   类型，`Marshal` 会把它们序列化成**裸 JSON 数字**（不是字符串）；
   不支持 JSON 的类型（如 channel）返回 `ErrInvalidManifest`，不会被
   悄悄改写。
+- **块级扩展的三种形态彼此区分并原样往返**：`attrs` 键缺省、
+  显式 `"attrs": null`、对象（含空对象 `{}`）是三种不同的线上形态，
+  分别对应 `Entry{Attrs: nil, AttrsNull: false}`、
+  `Entry{Attrs: nil, AttrsNull: true}` 与 `Entry{Attrs: 非 nil}`。
+  只要某处扩展没被主动修改，读改写后序列化字节与清单内容标识都和
+  改动前一致、可复现（`TestAttrsFormsDistinctAndPreserved`、
+  `TestNullAttrsUnmodifiedSurvivesKnownFieldEdit`）。条目级与清单级的
+  未知字段（包括显式 null 值）同样逐位保留。
 - 读改写：`GetObject` 拿到的 `*manifest.Manifest` 可直接修改已知字段或
   扩展字段，再用 `network.PutManifest(ctx, man, opt)` 写回。内容寻址
   保证旧版本永不被覆盖；扩展信息（含大整数、嵌套结构、null、空 attrs
@@ -190,10 +199,15 @@ manifest.MinVersion = 1, manifest.CurrentVersion = 2, manifest.MaxSupportedVersi
   标识可复现。
 - 并发：多个写入方对同一对象做读改写时，应按“读最新清单 → 合并自己的
   扩展 → `PutManifest` → 失败/落后则重试”的乐观 CAS 方式进行；写入只在
-  副本集合全部确认后才算成功，未确认不计数、不覆盖。已确认的每个清单
-  版本及其数据块在节点恢复后由读修复 / 后台修复补齐到副本因子，
-  **各写入方的扩展字段不会互相覆盖或丢失**
-  （`TestConcurrentReadModifyWritePreservesExtensions`、
+  副本集合全部确认后才算成功，未确认不计数、不覆盖。两个写入方基于
+  **同一版本**各自确认了新版本时，两个版本以不同内容标识并存、互不
+  覆盖；用 `manifest.MergeExtensions(winner, loser)` 把落败方已确认的
+  扩展并入胜方（目标侧键冲突时保留目标侧值；条目按相同块 ID 配对合并；
+  合并幂等）再写回，即可保证**双方已确认的扩展都不丢失**
+  （`TestConcurrentConflictingWritesMergeWithoutLoss`、
+  `TestMergeExtensionsUnionsConfirmedEdits`）。已确认的每个清单版本
+  及其数据块在节点恢复后由读修复 / 后台修复补齐到副本因子，各副本
+  收敛一致（`TestConcurrentReadModifyWritePreservesExtensions`、
   `TestExtensionsSurviveNodeOutageAndRecovery`）。
 
 ## 4. 本地验证方法
@@ -211,8 +225,8 @@ go test ./pkg/network -v
 go test -race -count=10 ./...
 
 # 只看本次新增的重点用例
-go test -v ./pkg/manifest -run 'ChunkAttrs|BigInt|Upgrade'
-go test -race -v ./pkg/network -run 'ChunkAttrs|ReadModifyWrite|Outage'
+go test -v ./pkg/manifest -run 'ChunkAttrs|BigInt|Upgrade|AttrsForms|NullAttrs|Merge'
+go test -race -v ./pkg/network -run 'ChunkAttrs|ReadModifyWrite|Outage|ConflictingWrites'
 
 # 一键端到端演示（写入 5 节点 / RF=3，携带清单级与块级扩展和大整数 → 副本损坏+节点下线 → 恢复 → 收敛）
 go run ./cmd/cas-demo
